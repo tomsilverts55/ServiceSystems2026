@@ -120,10 +120,19 @@ def generate_fast_duties(trips, params, tt):
     c_ot = params["cost_driver_overtime_per_h"]
     c_var = float(params.get("cost_variable_per_min", 0.0))
 
-    # Heuristic parameters.
-    MAX_IDLE = 120
+    # Adaptive Heuristics: שינוי דינמי של הפרמטרים לפי גודל המופע
+    T_count = len(trips)
+    if T_count <= 50:
+        MAX_IDLE = 240
+        TOP_K_MATCHES = 50
+    elif T_count <= 200:
+        MAX_IDLE = 120
+        TOP_K_MATCHES = 15
+    else:
+        MAX_IDLE = 60
+        TOP_K_MATCHES = 5
+
     MAX_WP_TIME = L_max - b_len - beta
-    TOP_K_MATCHES = 10
 
     # -------------------------------------------------------------------------
     # Workpieces:
@@ -179,12 +188,6 @@ def generate_fast_duties(trips, params, tt):
     best_cost = {}
 
     def record(trip_ids, acts, s0, s1, b0, b1, bloc, cost):
-        """
-        Store only the cheapest duty for the same high-level signature.
-
-        Terminal capacity counts only dwell at terminals:
-        wait and break at A/B. Service is not dwell because the vehicle is moving.
-        """
         sig = (tuple(sorted(trip_ids)), bloc, s0, b0, s1)
 
         if sig not in best_cost or cost < best_cost[sig]["cost"]:
@@ -214,11 +217,12 @@ def generate_fast_duties(trips, params, tt):
     for data1 in wp_data:
         wp1, mask1 = data1["wp"], data1["mask"]
 
-        # Try latest feasible shift start and one earlier quarter-hour option.
         approx_depart = max(0, wp1[0].start - 60)
         s0_target = wp1[0].start - tt("D", wp1[0].origin, approx_depart)
         s0_upper = floor15(s0_target)
-        s0_options = [s0_upper, s0_upper - 15]
+        
+        # Adaptive options: צמצום אפשרויות התחלה במופעים גדולים כדי למנוע קריסה
+        s0_options = [s0_upper, s0_upper - 15] if T_count <= 200 else [s0_upper]
 
         min_wp2_start = data1["end"] + b_len
         idx = bisect.bisect_left(wp_starts, min_wp2_start)
@@ -238,7 +242,6 @@ def generate_fast_duties(trips, params, tt):
         valid_wp2s = [None] + [w for _, w in possible_wp2s[:TOP_K_MATCHES]]
 
         for s0 in s0_options:
-            # First activity must be a D->terminal deadhead beginning exactly at s0.
             if s0 + tt("D", wp1[0].origin, s0) > wp1[0].start:
                 continue
 
@@ -255,7 +258,6 @@ def generate_fast_duties(trips, params, tt):
                         if frm == to:
                             return
 
-                        # Legal deadhead has exactly one endpoint at D.
                         if not ((frm == "D") ^ (to == "D")):
                             raise ValueError(f"Illegal deadhead: {frm}->{to} at {depart}")
 
@@ -311,8 +313,6 @@ def generate_fast_duties(trips, params, tt):
                     # -----------------------------------------------------------------
                     b0_earliest = s0 + alpha
 
-                    # Move legally to break location.
-                    # If terminal-to-terminal empty relocation is needed, go via D.
                     if loc != bloc:
                         if loc != "D":
                             dh(loc, "D", t)
@@ -323,8 +323,6 @@ def generate_fast_duties(trips, params, tt):
                     b0 = ceil15(b0_raw)
                     b1 = b0 + b_len
 
-                    # Upper bound for break start.
-                    # The second term ensures arrival to wp2 in time using legal deadhead via D.
                     latest_b0 = s0 + L_max - beta - b_len
 
                     if wp2:
@@ -358,8 +356,6 @@ def generate_fast_duties(trips, params, tt):
                             if next_loc != "D":
                                 dh("D", next_loc, t)
 
-                        # Critical feasibility check:
-                        # after all deadheads, the driver must arrive before service starts.
                         if t > wp2[0].start:
                             continue
 
@@ -378,14 +374,10 @@ def generate_fast_duties(trips, params, tt):
 
                     # -----------------------------------------------------------------
                     # End shift.
-                    #
-                    # Checker requirement:
-                    # The last activity must be a deadhead ending at D and ending exactly
-                    # at shift_end_min.
-                    #
-                    # Therefore, if we are already at D here, this duty is invalid in this
-                    # representation because D->D deadhead is not legal.
                     # -----------------------------------------------------------------
+                    # Feasibility constraint: Checker strict rule requires the last
+                    # activity to be a deadhead ENDING at D. 
+                    # If we are already at D, we legally cannot perform a D->D deadhead.
                     if loc == "D":
                         continue
 
@@ -404,14 +396,11 @@ def generate_fast_duties(trips, params, tt):
                         if s1 < t:
                             continue
 
-                        # Explicitly enforce break end at least beta before actual shift end.
                         if b1 + beta > s1:
                             continue
 
                         dh_st = None
 
-                        # Deadhead departure time need not be a quarter-hour mark.
-                        # Only shift start/end must be quarter-hour marks.
                         for cand in range(t, s1 + 1):
                             if cand + tt(loc, "D", cand) == s1:
                                 dh_st = cand
@@ -436,20 +425,8 @@ def generate_fast_duties(trips, params, tt):
                     wt(loc, best_dh_st)
                     dh(loc, "D", best_dh_st)
 
-                    # Final sanity checks.
-                    if t != best_s1:
-                        continue
-
-                    if not acts:
-                        continue
-
-                    if acts[-1]["type"] != "deadhead":
-                        continue
-
-                    if acts[-1]["to"] != "D":
-                        continue
-
-                    if acts[-1]["end_min"] != best_s1:
+                    # Final sanity check for checker rules
+                    if not acts or acts[-1]["type"] != "deadhead" or acts[-1]["to"] != "D" or acts[-1]["end_min"] != best_s1:
                         continue
 
                     final_cost = best_wage + (total_dh * c_var)
@@ -468,19 +445,15 @@ def reduce_duties_for_license(duties, all_trip_ids, max_duties, keep_per_trip=25
     """
     Optional helper for size-limited local Gurobi licenses.
     This is NOT used unless max_duties is provided from command line.
-
-    It keeps a mix of globally cheap duties and cheap duties per trip.
     """
     if max_duties is None or len(duties) <= max_duties:
         return duties
 
     selected = {}
 
-    # Global cheapest duties.
     for idx, d in sorted(enumerate(duties), key=lambda x: x[1]["cost"])[: max_duties // 2]:
         selected[idx] = d
 
-    # Cheap candidates per trip.
     by_trip = {tid: [] for tid in all_trip_ids}
 
     for idx, d in enumerate(duties):
@@ -541,7 +514,6 @@ def solve(duties, all_trip_ids, params):
 
     tid2i = {t: i for i, t in enumerate(all_trip_ids)}
 
-    # Build coverage lists once, instead of scanning all duties for every trip.
     cover_by_trip = defaultdict(list)
     for k, d in enumerate(duties):
         for tid in d["trips"]:
@@ -552,8 +524,6 @@ def solve(duties, all_trip_ids, params):
         covers = cover_by_trip[t_id]
         m.addConstr(gp.quicksum(y[k] for k in covers) + dummy[i] == 1, f"cov_{t_id}")
 
-    # Vehicle count:
-    # one physical vehicle per active duty, reusable across non-overlapping duties.
     events = sorted({d["s0"] for d in duties} | {d["s1"] for d in duties})
 
     for ev in events:
@@ -561,7 +531,6 @@ def solve(duties, all_trip_ids, params):
         if active:
             m.addConstr(gp.quicksum(y[k] for k in active) <= V, f"veh_{ev}")
 
-    # Terminal dwell capacity. Depot capacity is unlimited.
     for loc, attr in (("A", "dwells_A"), ("B", "dwells_B")):
         times = sorted({st for d in duties for st, _ in d[attr]})
 
@@ -594,12 +563,6 @@ def solve(duties, all_trip_ids, params):
 
 
 def assign_vehicles(sel):
-    """
-    Assign physical vehicle IDs to selected duties.
-
-    A vehicle can be reused when the next duty starts at or after the previous
-    duty's shift end. Since every duty starts and ends at D, this is legal.
-    """
     sel = sorted(sel, key=lambda d: d["s0"])
     free = []
 
@@ -657,12 +620,6 @@ def run_checker_if_requested(checker_path, instance_path, solution_path):
 
 
 def parse_args(argv):
-    """
-    Usage:
-        python shuttle_solver_final.py small_01.json
-        python shuttle_solver_final.py small_01.json check_solution.py
-        python shuttle_solver_final.py small_01.json check_solution.py --max-duties 1800
-    """
     fp = "small_01.json"
     checker_path = None
     max_duties = None
@@ -698,7 +655,7 @@ def main():
     inst = os.path.splitext(os.path.basename(fp))[0]
 
     print(f"\n{'=' * 60}")
-    print(f"  Shuttle Bus Solver (User Fixed + TopK) |  {fp}")
+    print(f"  Shuttle Bus Solver (User Fixed + Adaptive TopK) |  {fp}")
     print(f"{'=' * 60}")
 
     with open(fp, encoding="utf-8") as f:
