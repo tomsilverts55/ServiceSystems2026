@@ -1,4 +1,3 @@
-
 import json
 import sys
 import time
@@ -26,11 +25,12 @@ def make_tt(legs, buckets):
     """
     Time-dependent travel-time lookup.
 
-    Important: if a leg is missing, this is an error. Returning 0 would create
-    illegal teleporting moves and may produce infeasible solutions.
+    Important:
+    Returning 0 for a missing leg would create illegal teleporting moves.
+    Therefore a missing leg raises ValueError.
     """
     leg_idx = {l: i for i, l in enumerate(legs)}
-    bkt = [(b['from_min'], b['to_min'], b['minutes']) for b in buckets]
+    bkt = [(b["from_min"], b["to_min"], b["minutes"]) for b in buckets]
     cache = {}
 
     def tt(o, d, s):
@@ -60,20 +60,30 @@ def make_tt(legs, buckets):
 
 
 class Trip:
-    __slots__ = ('id', 'numeric_id', 'origin', 'dest', 'start', 'end')
+    __slots__ = ("id", "numeric_id", "origin", "dest", "start", "end")
 
     def __init__(self, d, tt):
-        self.id = d['trip_id']
-        # Kept close to your original code. For the project files, trip_id is numeric.
-        self.numeric_id = int(''.join(filter(str.isdigit, str(self.id))))
-        self.origin = d['origin']
-        self.dest = d['destination']
-        self.start = int(d['departure_min'])
+        self.id = d["trip_id"]
+
+        # Kept close to the original code.
+        # Project instances use numeric trip_id values.
+        digits = "".join(filter(str.isdigit, str(self.id)))
+        if not digits:
+            raise ValueError(f"trip_id must contain digits for bitmasking: {self.id}")
+        self.numeric_id = int(digits)
+
+        self.origin = d["origin"]
+        self.dest = d["destination"]
+        self.start = int(d["departure_min"])
         self.end = self.start + tt(self.origin, self.dest, self.start)
 
 
-# Driver wage: first 8 hours regular, overtime after 8 hours.
 def driver_wage(s0, s1, c_reg, c_ot):
+    """
+    Driver cost:
+    first 8 hours regular, any time after 8 hours overtime.
+    Shifts are generated with length >= 8 hours.
+    """
     paid = s1 - s0
     reg = min(paid, 480)
     ot = max(0, paid - 480)
@@ -82,42 +92,46 @@ def driver_wage(s0, s1, c_reg, c_ot):
 
 def dh_via_D_time(tt, frm, to, depart):
     """
-    Legal empty movement time.
+    Legal empty relocation time.
 
     Deadhead is allowed only D<->A or D<->B.
-    Therefore an empty A<->B relocation must be performed via D.
+    Therefore an empty A<->B relocation must go via D.
     """
     if frm == to:
         return 0
 
-    if frm == 'D' or to == 'D':
+    if frm == "D" or to == "D":
         return tt(frm, to, depart)
 
-    first = tt(frm, 'D', depart)
-    second = tt('D', to, depart + first)
+    first = tt(frm, "D", depart)
+    second = tt("D", to, depart + first)
     return first + second
 
 
 def generate_fast_duties(trips, params, tt):
     t_start = time.time()
 
-    alpha = int(params['break_min_from_start_hours'] * 60)
-    beta = int(params['break_min_from_end_hours'] * 60)
-    b_len = int(params['break_length_hours'] * 60)
-    L_min = int(params['shift_min_hours'] * 60)
-    L_max = int(params['shift_max_hours'] * 60)
-    c_reg = params['cost_driver_regular_per_h']
-    c_ot = params['cost_driver_overtime_per_h']
-    c_var = float(params.get('cost_variable_per_min', 0.0))
+    alpha = int(params["break_min_from_start_hours"] * 60)
+    beta = int(params["break_min_from_end_hours"] * 60)
+    b_len = int(params["break_length_hours"] * 60)
+    L_min = int(params["shift_min_hours"] * 60)
+    L_max = int(params["shift_max_hours"] * 60)
+    c_reg = params["cost_driver_regular_per_h"]
+    c_ot = params["cost_driver_overtime_per_h"]
+    c_var = float(params.get("cost_variable_per_min", 0.0))
 
-    MAX_IDLE = 120      # heuristic maximum terminal waiting time inside a workpiece
+    # Heuristic parameters.
+    MAX_IDLE = 120
     MAX_WP_TIME = L_max - b_len - beta
+    TOP_K_MATCHES = 10
 
     # -------------------------------------------------------------------------
-    # Build workpieces: consecutive service trips where the destination of one
-    # trip is the origin of the next trip. This is a heuristic restriction.
+    # Workpieces:
+    # Consecutive service trips where the destination of one trip is the origin
+    # of the next trip. This is a heuristic restriction.
     # -------------------------------------------------------------------------
     adj = defaultdict(list)
+
     for u in trips:
         for v in trips:
             if u.id != v.id and u.dest == v.origin:
@@ -129,8 +143,10 @@ def generate_fast_duties(trips, params, tt):
 
     def dfs(trip, path):
         workpieces.append(list(path))
+
         if path[-1].end - path[0].start >= MAX_WP_TIME:
             return
+
         for nxt in adj[trip.id]:
             if nxt.start >= path[-1].end:
                 path.append(nxt)
@@ -149,77 +165,88 @@ def generate_fast_duties(trips, params, tt):
         mask = 0
         for tr in wp:
             mask |= (1 << tr.numeric_id)
-        wp_data.append({'wp': wp, 'mask': mask, 'start': wp[0].start, 'end': wp[-1].end})
 
-    wp_data.sort(key=lambda d: d['start'])
-    wp_starts = [d['start'] for d in wp_data]
+        wp_data.append({
+            "wp": wp,
+            "mask": mask,
+            "start": wp[0].start,
+            "end": wp[-1].end,
+        })
+
+    wp_data.sort(key=lambda d: d["start"])
+    wp_starts = [d["start"] for d in wp_data]
 
     best_cost = {}
 
     def record(trip_ids, acts, s0, s1, b0, b1, bloc, cost):
-        # Keep only the cheapest duty for the same covered trips, break location,
-        # shift start, and break start.
-        sig = (tuple(sorted(trip_ids)), bloc, s0, b0)
-        if sig not in best_cost or cost < best_cost[sig]['cost']:
+        """
+        Store only the cheapest duty for the same high-level signature.
+
+        Terminal capacity counts only dwell at terminals:
+        wait and break at A/B. Service is not dwell because the vehicle is moving.
+        """
+        sig = (tuple(sorted(trip_ids)), bloc, s0, b0, s1)
+
+        if sig not in best_cost or cost < best_cost[sig]["cost"]:
             best_cost[sig] = {
-                'trips': list(trip_ids),
-                'acts': acts,
-                's0': s0,
-                's1': s1,
-                'b0': b0,
-                'b1': b1,
-                'bloc': bloc,
-                'cost': cost,
-                'dwells_A': [
-                    (a['start_min'], a['end_min'])
+                "trips": list(trip_ids),
+                "acts": acts,
+                "s0": s0,
+                "s1": s1,
+                "b0": b0,
+                "b1": b1,
+                "bloc": bloc,
+                "cost": cost,
+                "dwells_A": [
+                    (a["start_min"], a["end_min"])
                     for a in acts
-                    if a['type'] in ('wait', 'break') and a.get('at') == 'A'
+                    if a["type"] in ("wait", "break") and a.get("at") == "A"
                 ],
-                'dwells_B': [
-                    (a['start_min'], a['end_min'])
+                "dwells_B": [
+                    (a["start_min"], a["end_min"])
                     for a in acts
-                    if a['type'] in ('wait', 'break') and a.get('at') == 'B'
+                    if a["type"] in ("wait", "break") and a.get("at") == "B"
                 ],
             }
 
     MAX_SPAN = L_max - b_len
-    TOP_K_MATCHES = 10  # heuristic: keep the 10 closest second workpieces
 
     for data1 in wp_data:
-        wp1, mask1 = data1['wp'], data1['mask']
+        wp1, mask1 = data1["wp"], data1["mask"]
 
-        # Shift starts at a quarter-hour mark. We try the latest feasible start
-        # and one earlier quarter-hour option, as in the original code.
+        # Try latest feasible shift start and one earlier quarter-hour option.
         approx_depart = max(0, wp1[0].start - 60)
-        s0_target = wp1[0].start - tt('D', wp1[0].origin, approx_depart)
+        s0_target = wp1[0].start - tt("D", wp1[0].origin, approx_depart)
         s0_upper = floor15(s0_target)
         s0_options = [s0_upper, s0_upper - 15]
 
-        min_wp2_start = data1['end'] + b_len
+        min_wp2_start = data1["end"] + b_len
         idx = bisect.bisect_left(wp_starts, min_wp2_start)
 
         possible_wp2s = []
         for data2 in wp_data[idx:]:
-            if data2['end'] - wp1[0].start > MAX_SPAN:
+            if data2["end"] - wp1[0].start > MAX_SPAN:
                 continue
-            if mask1 & data2['mask']:
+
+            if mask1 & data2["mask"]:
                 continue
-            gap = data2['start'] - min_wp2_start
-            possible_wp2s.append((gap, data2['wp']))
+
+            gap = data2["start"] - min_wp2_start
+            possible_wp2s.append((gap, data2["wp"]))
 
         possible_wp2s.sort(key=lambda x: x[0])
-        valid_wp2s = [None] + [w for g, w in possible_wp2s[:TOP_K_MATCHES]]
+        valid_wp2s = [None] + [w for _, w in possible_wp2s[:TOP_K_MATCHES]]
 
         for s0 in s0_options:
-            # First activity must be D -> first origin starting exactly at s0.
-            if s0 + tt('D', wp1[0].origin, s0) > wp1[0].start:
+            # First activity must be a D->terminal deadhead beginning exactly at s0.
+            if s0 + tt("D", wp1[0].origin, s0) > wp1[0].start:
                 continue
 
             for wp2 in valid_wp2s:
-                for bloc in ['A', 'B', 'D']:
+                for bloc in ["A", "B", "D"]:
                     acts = []
                     t = s0
-                    loc = 'D'
+                    loc = "D"
                     total_dh = 0
 
                     def dh(frm, to, depart):
@@ -228,11 +255,12 @@ def generate_fast_duties(trips, params, tt):
                         if frm == to:
                             return
 
-                        # Legal deadhead: exactly one endpoint must be D.
-                        if not ((frm == 'D') ^ (to == 'D')):
+                        # Legal deadhead has exactly one endpoint at D.
+                        if not ((frm == "D") ^ (to == "D")):
                             raise ValueError(f"Illegal deadhead: {frm}->{to} at {depart}")
 
                         dur = tt(frm, to, depart)
+
                         acts.append({
                             "type": "deadhead",
                             "from": frm,
@@ -240,12 +268,14 @@ def generate_fast_duties(trips, params, tt):
                             "start_min": depart,
                             "end_min": depart + dur,
                         })
+
                         total_dh += dur
                         t = depart + dur
                         loc = to
 
                     def wt(loc_at, until):
                         nonlocal t
+
                         if until > t:
                             acts.append({
                                 "type": "wait",
@@ -258,19 +288,21 @@ def generate_fast_duties(trips, params, tt):
                     # -----------------------------------------------------------------
                     # WP1
                     # -----------------------------------------------------------------
-                    dh('D', wp1[0].origin, t)
+                    dh("D", wp1[0].origin, t)
 
                     if t > wp1[0].start:
                         continue
 
                     for tr in wp1:
                         wt(tr.origin, tr.start)
+
                         acts.append({
                             "type": "service",
                             "trip_id": tr.id,
                             "start_min": tr.start,
                             "end_min": tr.end,
                         })
+
                         t = tr.end
                         loc = tr.dest
 
@@ -279,18 +311,22 @@ def generate_fast_duties(trips, params, tt):
                     # -----------------------------------------------------------------
                     b0_earliest = s0 + alpha
 
-                    # Move legally to the break location, via D if needed.
+                    # Move legally to break location.
+                    # If terminal-to-terminal empty relocation is needed, go via D.
                     if loc != bloc:
-                        if loc != 'D':
-                            dh(loc, 'D', t)
-                        if bloc != 'D':
-                            dh('D', bloc, t)
+                        if loc != "D":
+                            dh(loc, "D", t)
+                        if bloc != "D":
+                            dh("D", bloc, t)
 
                     b0_raw = max(b0_earliest, t)
                     b0 = ceil15(b0_raw)
                     b1 = b0 + b_len
 
+                    # Upper bound for break start.
+                    # The second term ensures arrival to wp2 in time using legal deadhead via D.
                     latest_b0 = s0 + L_max - beta - b_len
+
                     if wp2:
                         travel_after_break = dh_via_D_time(tt, bloc, wp2[0].origin, b1)
                         latest_b0 = min(latest_b0, wp2[0].start - travel_after_break - b_len)
@@ -299,12 +335,14 @@ def generate_fast_duties(trips, params, tt):
                         continue
 
                     wt(bloc, b0)
+
                     acts.append({
                         "type": "break",
                         "at": bloc,
                         "start_min": b0,
                         "end_min": b1,
                     })
+
                     t = b1
                     loc = bloc
 
@@ -313,50 +351,69 @@ def generate_fast_duties(trips, params, tt):
                     # -----------------------------------------------------------------
                     if wp2:
                         next_loc = wp2[0].origin
-                        if loc != next_loc:
-                            if loc != 'D':
-                                dh(loc, 'D', t)
-                            if next_loc != 'D':
-                                dh('D', next_loc, t)
 
-                        # Critical feasibility check: do not start service before arrival.
+                        if loc != next_loc:
+                            if loc != "D":
+                                dh(loc, "D", t)
+                            if next_loc != "D":
+                                dh("D", next_loc, t)
+
+                        # Critical feasibility check:
+                        # after all deadheads, the driver must arrive before service starts.
                         if t > wp2[0].start:
                             continue
 
                         for tr in wp2:
                             wt(tr.origin, tr.start)
+
                             acts.append({
                                 "type": "service",
                                 "trip_id": tr.id,
                                 "start_min": tr.start,
                                 "end_min": tr.end,
                             })
+
                             t = tr.end
                             loc = tr.dest
 
                     # -----------------------------------------------------------------
-                    # End shift: last activity must be deadhead to D ending exactly at s1.
+                    # End shift.
+                    #
+                    # Checker requirement:
+                    # The last activity must be a deadhead ending at D and ending exactly
+                    # at shift_end_min.
+                    #
+                    # Therefore, if we are already at D here, this duty is invalid in this
+                    # representation because D->D deadhead is not legal.
                     # -----------------------------------------------------------------
+                    if loc == "D":
+                        continue
+
                     s1_min = ceil15(max(s0 + L_min, b1 + beta))
                     s1_max = s0 + L_max
+
                     if s1_min > s1_max:
                         continue
 
-                    # If already at depot, we can end the shift there without a final deadhead.
                     best_s1 = None
                     best_dh_st = None
-                    best_c = float('inf')
-                    best_score = float('inf')
+                    best_wage = None
+                    best_score = float("inf")
 
                     for s1 in range(s1_min, s1_max + 1, 15):
                         if s1 < t:
                             continue
 
+                        # Explicitly enforce break end at least beta before actual shift end.
+                        if b1 + beta > s1:
+                            continue
+
                         dh_st = None
 
-                        # cand can be any minute. Only shift start/end must be on quarter-hour marks.
+                        # Deadhead departure time need not be a quarter-hour mark.
+                        # Only shift start/end must be quarter-hour marks.
                         for cand in range(t, s1 + 1):
-                            if cand + tt(loc, 'D', cand) == s1:
+                            if cand + tt(loc, "D", cand) == s1:
                                 dh_st = cand
                                 break
 
@@ -364,36 +421,39 @@ def generate_fast_duties(trips, params, tt):
                             continue
 
                         wage_c = driver_wage(s0, s1, c_reg, c_ot)
-                        return_dh = tt(loc, 'D', dh_st)
+                        return_dh = tt(loc, "D", dh_st)
                         score = wage_c + (total_dh + return_dh) * c_var
 
                         if score < best_score:
                             best_score = score
-                            best_c = wage_c
+                            best_wage = wage_c
                             best_s1 = s1
                             best_dh_st = dh_st
 
                     if best_s1 is None:
                         continue
 
-                    if loc == 'D':
-                        wt(loc, best_s1)
-                    else:
-                        wt(loc, best_dh_st)
-                        dh(loc, 'D', best_dh_st)
+                    wt(loc, best_dh_st)
+                    dh(loc, "D", best_dh_st)
 
-                    # Sanity: if ending at depot, either finish with a final deadhead or
-                    # simply be at D at the shift end time.
-                    if loc == 'D':
-                        if t != best_s1:
-                            continue
-                    else:
-                        if not acts or acts[-1]['type'] != 'deadhead' or acts[-1]['to'] != 'D':
-                            continue
-                        if acts[-1]['end_min'] != best_s1:
-                            continue
+                    # Final sanity checks.
+                    if t != best_s1:
+                        continue
 
-                    final_cost = best_c + (total_dh * c_var)
+                    if not acts:
+                        continue
+
+                    if acts[-1]["type"] != "deadhead":
+                        continue
+
+                    if acts[-1]["to"] != "D":
+                        continue
+
+                    if acts[-1]["end_min"] != best_s1:
+                        continue
+
+                    final_cost = best_wage + (total_dh * c_var)
+
                     trip_ids = [tr.id for tr in wp1]
                     if wp2:
                         trip_ids.extend([tr.id for tr in wp2])
@@ -404,14 +464,59 @@ def generate_fast_duties(trips, params, tt):
     return list(best_cost.values())
 
 
+def reduce_duties_for_license(duties, all_trip_ids, max_duties, keep_per_trip=25):
+    """
+    Optional helper for size-limited local Gurobi licenses.
+    This is NOT used unless max_duties is provided from command line.
+
+    It keeps a mix of globally cheap duties and cheap duties per trip.
+    """
+    if max_duties is None or len(duties) <= max_duties:
+        return duties
+
+    selected = {}
+
+    # Global cheapest duties.
+    for idx, d in sorted(enumerate(duties), key=lambda x: x[1]["cost"])[: max_duties // 2]:
+        selected[idx] = d
+
+    # Cheap candidates per trip.
+    by_trip = {tid: [] for tid in all_trip_ids}
+
+    for idx, d in enumerate(duties):
+        for tid in d["trips"]:
+            if tid in by_trip:
+                by_trip[tid].append((d["cost"], idx, d))
+
+    for tid in all_trip_ids:
+        candidates = sorted(by_trip[tid], key=lambda x: x[0])[:keep_per_trip]
+
+        for _, idx, d in candidates:
+            selected[idx] = d
+
+        if len(selected) >= max_duties:
+            break
+
+    reduced = list(selected.values())
+
+    if len(reduced) > max_duties:
+        reduced = sorted(reduced, key=lambda d: d["cost"])[:max_duties]
+
+    print(f"    Reduced duties: {len(duties)} -> {len(reduced)}")
+    return reduced
+
+
 def solve(duties, all_trip_ids, params):
     t_setup = time.time()
-    c_fix = params['cost_fixed_vehicle']
-    cap = params['terminal_capacity']
+
+    c_fix = params["cost_fixed_vehicle"]
+    cap = params["terminal_capacity"]
 
     K = len(duties)
     T = len(all_trip_ids)
+
     print(f"    [Timer] Setup Phase 2 variables took {time.time() - t_setup:.3f}s")
+    print(f"    MILP size before constraints: {K} duty variables + {T} slack variables + 1 vehicle variable")
 
     m = gp.Model("ShuttleBus_TopK")
     m.Params.TimeLimit = 120
@@ -420,40 +525,53 @@ def solve(duties, all_trip_ids, params):
     m.Params.OutputFlag = 1
 
     t_model = time.time()
+
     y = m.addVars(K, vtype=GRB.BINARY, name="y")
     dummy = m.addVars(T, vtype=GRB.CONTINUOUS, lb=0, name="slack")
     V = m.addVar(vtype=GRB.INTEGER, lb=0, name="V")
 
     PENALTY = 500_000
+
     m.setObjective(
         c_fix * V
-        + gp.quicksum(duties[k]['cost'] * y[k] for k in range(K))
+        + gp.quicksum(duties[k]["cost"] * y[k] for k in range(K))
         + gp.quicksum(PENALTY * dummy[i] for i in range(T)),
         GRB.MINIMIZE,
     )
 
     tid2i = {t: i for i, t in enumerate(all_trip_ids)}
 
+    # Build coverage lists once, instead of scanning all duties for every trip.
+    cover_by_trip = defaultdict(list)
+    for k, d in enumerate(duties):
+        for tid in d["trips"]:
+            cover_by_trip[tid].append(k)
+
     for t_id in all_trip_ids:
         i = tid2i[t_id]
-        covers = [k for k in range(K) if t_id in duties[k]['trips']]
+        covers = cover_by_trip[t_id]
         m.addConstr(gp.quicksum(y[k] for k in covers) + dummy[i] == 1, f"cov_{t_id}")
 
-    # Vehicle count: one physical vehicle per active duty, reusable across non-overlapping duties.
-    events = sorted({d['s0'] for d in duties} | {d['s1'] for d in duties})
+    # Vehicle count:
+    # one physical vehicle per active duty, reusable across non-overlapping duties.
+    events = sorted({d["s0"] for d in duties} | {d["s1"] for d in duties})
+
     for ev in events:
-        active = [k for k in range(K) if duties[k]['s0'] <= ev < duties[k]['s1']]
+        active = [k for k in range(K) if duties[k]["s0"] <= ev < duties[k]["s1"]]
         if active:
             m.addConstr(gp.quicksum(y[k] for k in active) <= V, f"veh_{ev}")
 
     # Terminal dwell capacity. Depot capacity is unlimited.
-    for loc, attr in (('A', 'dwells_A'), ('B', 'dwells_B')):
+    for loc, attr in (("A", "dwells_A"), ("B", "dwells_B")):
         times = sorted({st for d in duties for st, _ in d[attr]})
+
         for ev in times:
             dwell = [
-                k for k in range(K)
+                k
+                for k in range(K)
                 if any(st <= ev < et for st, et in duties[k][attr])
             ]
+
             if dwell:
                 m.addConstr(gp.quicksum(y[k] for k in dwell) <= cap, f"cap_{loc}_{ev}")
 
@@ -471,31 +589,40 @@ def solve(duties, all_trip_ids, params):
 
     sel = [duties[k] for k in range(K) if y[k].X > 0.5]
     uncov = [all_trip_ids[i] for i in range(T) if dummy[i].X > 0.5]
+
     return sel, uncov
 
 
 def assign_vehicles(sel):
-    sel = sorted(sel, key=lambda d: d['s0'])
+    """
+    Assign physical vehicle IDs to selected duties.
+
+    A vehicle can be reused when the next duty starts at or after the previous
+    duty's shift end. Since every duty starts and ends at D, this is legal.
+    """
+    sel = sorted(sel, key=lambda d: d["s0"])
     free = []
 
     for d in sel:
-        reuse = next((i for i, (ft, _) in enumerate(free) if d['s0'] >= ft), None)
+        reuse = next((i for i, (ft, _) in enumerate(free) if d["s0"] >= ft), None)
+
         if reuse is None:
             lbl = f"v{len(free) + 1}"
-            free.append((d['s1'], lbl))
+            free.append((d["s1"], lbl))
         else:
             _, lbl = free[reuse]
-            free[reuse] = (d['s1'], lbl)
-        d['vehicle_id'] = lbl
+            free[reuse] = (d["s1"], lbl)
+
+        d["vehicle_id"] = lbl
 
     return sel
 
 
 def dh_cost(acts, c_var):
     return sum(
-        (a['end_min'] - a['start_min'])
+        (a["end_min"] - a["start_min"])
         for a in acts
-        if a['type'] == 'deadhead'
+        if a["type"] == "deadhead"
     ) * c_var
 
 
@@ -513,25 +640,60 @@ def run_checker_if_requested(checker_path, instance_path, solution_path):
             [sys.executable, checker_path, instance_path, solution_path],
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=120,
         )
+
         if res.stdout:
             print(res.stdout)
+
         if res.stderr:
             print(res.stderr)
+
         if res.returncode != 0:
             print(f"Checker exited with code {res.returncode}")
+
     except Exception as e:
         print(f"Could not run checker: {e}")
 
 
+def parse_args(argv):
+    """
+    Usage:
+        python shuttle_solver_final.py small_01.json
+        python shuttle_solver_final.py small_01.json check_solution.py
+        python shuttle_solver_final.py small_01.json check_solution.py --max-duties 1800
+    """
+    fp = "small_01.json"
+    checker_path = None
+    max_duties = None
+
+    positional = []
+    i = 1
+
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg == "--max-duties":
+            if i + 1 >= len(argv):
+                raise ValueError("--max-duties requires an integer value")
+            max_duties = int(argv[i + 1])
+            i += 2
+            continue
+
+        positional.append(arg)
+        i += 1
+
+    if len(positional) >= 1:
+        fp = positional[0]
+
+    if len(positional) >= 2:
+        checker_path = positional[1]
+
+    return fp, checker_path, max_duties
+
+
 def main():
-    if len(sys.argv) < 2:
-        fp = "small_01.json"
-        checker_path = None
-    else:
-        fp = sys.argv[1]
-        checker_path = sys.argv[2] if len(sys.argv) >= 3 else None
+    fp, checker_path, max_duties = parse_args(sys.argv)
 
     inst = os.path.splitext(os.path.basename(fp))[0]
 
@@ -539,12 +701,13 @@ def main():
     print(f"  Shuttle Bus Solver (User Fixed + TopK) |  {fp}")
     print(f"{'=' * 60}")
 
-    with open(fp, encoding='utf-8') as f:
+    with open(fp, encoding="utf-8") as f:
         data = json.load(f)
 
-    params = data['parameters']
-    tt = make_tt(data['travel_time']['legs'], data['travel_time']['buckets'])
-    trips = sorted([Trip(t, tt) for t in data['trips']], key=lambda x: x.start)
+    params = data["parameters"]
+    tt = make_tt(data["travel_time"]["legs"], data["travel_time"]["buckets"])
+
+    trips = sorted([Trip(t, tt) for t in data["trips"]], key=lambda x: x.start)
     tids = [t.id for t in trips]
 
     t_global = time.time()
@@ -558,6 +721,9 @@ def main():
 
     print(f"    Generated {len(duties)} unique duties.")
 
+    if max_duties is not None:
+        duties = reduce_duties_for_license(duties, tids, max_duties)
+
     print("\n[Phase 2] MILP Optimization...")
     sel, uncov = solve(duties, tids, params)
 
@@ -569,40 +735,45 @@ def main():
         print(f"  *** UNCOVERED TRIPS: {uncov} ***")
         print("  Infeasible for submission. Not writing solution file.")
         return
-    else:
-        print("  All trips covered successfully!")
+
+    print("  All trips covered successfully!")
 
     sel = assign_vehicles(sel)
-    n_v = len({d['vehicle_id'] for d in sel})
+    n_v = len({d["vehicle_id"] for d in sel})
 
     out_duties = []
-    for i, d in enumerate(sorted(sel, key=lambda x: x['s0'])):
+
+    for i, d in enumerate(sorted(sel, key=lambda x: x["s0"])):
         out_duties.append({
             "duty_id": f"k{i + 1}",
             "driver_id": f"d{i + 1}",
-            "vehicle_id": d['vehicle_id'],
-            "shift_start_min": d['s0'],
-            "shift_end_min": d['s1'],
-            "break_start_min": d['b0'],
-            "break_end_min": d['b1'],
-            "break_location": d['bloc'],
-            "activities": d['acts'],
+            "vehicle_id": d["vehicle_id"],
+            "shift_start_min": d["s0"],
+            "shift_end_min": d["s1"],
+            "break_start_min": d["b0"],
+            "break_end_min": d["b1"],
+            "break_location": d["bloc"],
+            "activities": d["acts"],
         })
 
-    out = {"instance_id": inst, "duties": out_duties}
+    out = {
+        "instance_id": inst,
+        "duties": out_duties,
+    }
+
     out_fp = f"solution_{inst}.json"
 
-    with open(out_fp, 'w', encoding='utf-8') as f:
+    with open(out_fp, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
 
-    c_fix = params['cost_fixed_vehicle']
-    c_var = float(params.get('cost_variable_per_min', 0.0))
-    c_reg = params['cost_driver_regular_per_h']
-    c_ot = params['cost_driver_overtime_per_h']
+    c_fix = params["cost_fixed_vehicle"]
+    c_var = float(params.get("cost_variable_per_min", 0.0))
+    c_reg = params["cost_driver_regular_per_h"]
+    c_ot = params["cost_driver_overtime_per_h"]
 
     veh_cost = n_v * c_fix
-    driver_cost = sum(driver_wage(d['s0'], d['s1'], c_reg, c_ot) for d in sel)
-    dh_cost_tot = sum(dh_cost(d['acts'], c_var) for d in sel)
+    driver_cost = sum(driver_wage(d["s0"], d["s1"], c_reg, c_ot) for d in sel)
+    dh_cost_tot = sum(dh_cost(d["acts"], c_var) for d in sel)
     total = veh_cost + driver_cost + dh_cost_tot
 
     print(f"\n{'=' * 60}")
